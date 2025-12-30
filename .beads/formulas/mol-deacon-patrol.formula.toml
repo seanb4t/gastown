@@ -12,7 +12,7 @@ Witnesses detect it and escalate to the Mayor.
 The Deacon's agent bead last_activity timestamp is updated during each patrol
 cycle. Witnesses check this timestamp to verify health."""
 formula = "mol-deacon-patrol"
-version = 3
+version = 4
 
 [[steps]]
 id = "inbox-check"
@@ -54,6 +54,19 @@ Archive after processing:
 ```bash
 gt mail archive <message-id>
 ```
+
+**DOG_DONE messages**:
+Dogs report completion after infrastructure tasks (orphan-scan, session-gc, etc.).
+Subject format: `DOG_DONE <hostname>`
+Body contains: task name, counts, status.
+```bash
+# Parse the report, log metrics if needed
+gt mail read <id>
+# Archive after noting completion
+gt mail archive <message-id>
+```
+Dogs return to idle automatically. The report is informational - no action needed
+unless the dog reports errors that require escalation.
 
 Callbacks may spawn new polecats, update issue state, or trigger other actions.
 
@@ -318,51 +331,104 @@ Plugins marked parallel: true can run concurrently using Task tool subagents. Se
 Skip this step if ~/gt/plugins/ does not exist or is empty."""
 
 [[steps]]
-id = "orphan-check"
-title = "Find abandoned work"
+id = "dog-pool-maintenance"
+title = "Maintain dog pool"
 needs = ["health-scan"]
 description = """
-Find abandoned work.
+Ensure dog pool has available workers for dispatch.
 
-Scan for orphaned state:
-- Issues marked in_progress with no active polecat
-- Polecats that stopped responding mid-work
-- Merge queue entries with no polecat owner
-- Wisp sessions that outlived their spawner
-
+**Step 1: Check dog pool status**
 ```bash
-bd list --status=in_progress
-gt polecats --all --orphan
+gt dog status
+# Shows idle/working counts
 ```
 
-For each orphan:
-- Check if polecat session still exists
-- If not, mark issue for reassignment or retry
-- File incident beads if data loss occurred"""
+**Step 2: Ensure minimum idle dogs**
+If idle count is 0 and working count is at capacity, consider spawning:
+```bash
+# If no idle dogs available
+gt dog add <name>
+# Names: alpha, bravo, charlie, delta, etc.
+```
+
+**Step 3: Retire stale dogs (optional)**
+Dogs that have been idle for >24 hours can be removed to save resources:
+```bash
+gt dog status <name>
+# Check last_active timestamp
+# If idle > 24h: gt dog remove <name>
+```
+
+**Pool sizing guidelines:**
+- Minimum: 1 idle dog always available
+- Maximum: 4 dogs total (balance resources vs throughput)
+- Spawn on demand when pool is empty
+
+**Exit criteria:** Pool has at least 1 idle dog."""
+
+[[steps]]
+id = "orphan-check"
+title = "Detect abandoned work"
+needs = ["dog-pool-maintenance"]
+description = """
+**DETECT ONLY** - Check for orphaned state and dispatch to dog if found.
+
+**Step 1: Quick orphan scan**
+```bash
+# Check for in_progress issues with dead assignees
+bd list --status=in_progress --json | head -20
+```
+
+For each in_progress issue, check if assignee session exists:
+```bash
+tmux has-session -t <session> 2>/dev/null && echo "alive" || echo "orphan"
+```
+
+**Step 2: If orphans detected, dispatch to dog**
+```bash
+# Sling orphan-scan formula to an idle dog
+gt sling mol-orphan-scan deacon/dogs --var scope=town
+```
+
+**Important:** Do NOT fix orphans inline. Dogs handle recovery.
+The Deacon's job is detection and dispatch, not execution.
+
+**Step 3: If no orphans detected**
+Skip dispatch - nothing to do.
+
+**Exit criteria:** Orphan scan dispatched to dog (if needed)."""
 
 [[steps]]
 id = "session-gc"
-title = "Clean dead sessions"
+title = "Detect cleanup needs"
 needs = ["orphan-check"]
 description = """
-Clean dead sessions and orphaned state.
+**DETECT ONLY** - Check if cleanup is needed and dispatch to dog.
 
-Run `gt doctor --fix` to handle all cleanup:
-
+**Step 1: Preview cleanup needs**
 ```bash
-# Preview what needs cleaning
 gt doctor -v
-
-# Fix everything
-gt doctor --fix
+# Check output for issues that need cleaning
 ```
 
-This handles:
-- **orphan-sessions**: Kill orphaned tmux sessions (gt-* not matching valid patterns)
-- **orphan-processes**: Kill orphaned Claude processes (no tmux parent)
-- **wisp-gc**: Garbage collect abandoned wisps (>1h old)
+**Step 2: If cleanup needed, dispatch to dog**
+```bash
+# Sling session-gc formula to an idle dog
+gt sling mol-session-gc deacon/dogs --var mode=conservative
+```
 
-All cleanup is handled by doctor checks - no need to run separate commands."""
+**Important:** Do NOT run `gt doctor --fix` inline. Dogs handle cleanup.
+The Deacon stays lightweight - detection only.
+
+**Step 3: If nothing to clean**
+Skip dispatch - system is healthy.
+
+**Cleanup types (for reference):**
+- orphan-sessions: Dead tmux sessions
+- orphan-processes: Orphaned Claude processes
+- wisp-gc: Old wisps past retention
+
+**Exit criteria:** Session GC dispatched to dog (if needed)."""
 
 [[steps]]
 id = "log-maintenance"
