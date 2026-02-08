@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
@@ -132,6 +134,39 @@ func NewManager(r *rig.Rig, g *git.Git, t *tmux.Tmux) *Manager {
 		namePool: pool,
 		tmux:     t,
 	}
+}
+
+// lockPolecat acquires an exclusive file lock for a specific polecat.
+// This prevents concurrent gt processes from racing on the same polecat's
+// filesystem operations (Add, Remove, RepairWorktree).
+// Caller must defer fl.Unlock().
+func (m *Manager) lockPolecat(name string) (*flock.Flock, error) {
+	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, fmt.Sprintf("polecat-%s.lock", name))
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring polecat lock for %s: %w", name, err)
+	}
+	return fl, nil
+}
+
+// lockPool acquires an exclusive file lock for name pool operations.
+// This prevents concurrent gt processes from racing on AllocateName/ReconcilePool.
+// Caller must defer fl.Unlock().
+func (m *Manager) lockPool() (*flock.Flock, error) {
+	lockDir := filepath.Join(m.rig.Path, ".runtime", "locks")
+	if err := os.MkdirAll(lockDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating lock dir: %w", err)
+	}
+	lockPath := filepath.Join(lockDir, "polecat-pool.lock")
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring pool lock: %w", err)
+	}
+	return fl, nil
 }
 
 // CheckDoltHealth verifies that the Dolt database is reachable before spawning.
@@ -499,6 +534,13 @@ func (m *Manager) Add(name string) (*Polecat, error) {
 // This allows setting hook_bead atomically at creation time, avoiding
 // cross-beads routing issues when slinging work to new polecats.
 func (m *Manager) AddWithOptions(name string, opts AddOptions) (*Polecat, error) {
+	// Acquire per-polecat file lock to prevent concurrent Add/Remove/Repair races
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	if m.exists(name) {
 		return nil, ErrPolecatExists
 	}
@@ -656,6 +698,13 @@ func (m *Manager) Remove(name string, force bool) error {
 // ZFC #10: Uses cleanup_status from agent bead if available (polecat self-report),
 // falls back to git check for backward compatibility.
 func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) error {
+	// Acquire per-polecat file lock to prevent concurrent Remove races
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	if !m.exists(name) {
 		return ErrPolecatNotFound
 	}
@@ -860,8 +909,15 @@ func forceRemoveDir(dir string) error {
 // Returns a pooled name (polecat-01 through polecat-50) if available,
 // otherwise returns an overflow name (rigname-N).
 func (m *Manager) AllocateName() (string, error) {
-	// First reconcile pool with existing polecats to handle stale state
-	m.ReconcilePool()
+	// Acquire pool lock to prevent concurrent allocations from racing
+	fl, err := m.lockPool()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	// Reconcile without re-acquiring the pool lock
+	m.reconcilePoolInternal()
 
 	name, err := m.namePool.Allocate()
 	if err != nil {
@@ -901,6 +957,13 @@ func (m *Manager) RepairWorktree(name string, force bool) (*Polecat, error) {
 // Allows setting hook_bead atomically at repair time.
 // After repair, uses new structure: polecats/<name>/<rigname>/
 func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOptions) (*Polecat, error) {
+	// Acquire per-polecat file lock to prevent concurrent Repair/Remove races
+	fl, err := m.lockPolecat(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	if !m.exists(name) {
 		return nil, ErrPolecatNotFound
 	}
@@ -1052,6 +1115,18 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 // In addition to directory checks, this also:
 // - Kills orphaned tmux sessions (sessions without directories are broken)
 func (m *Manager) ReconcilePool() {
+	fl, err := m.lockPool()
+	if err != nil {
+		return
+	}
+	defer func() { _ = fl.Unlock() }()
+
+	m.reconcilePoolInternal()
+}
+
+// reconcilePoolInternal performs pool reconciliation without acquiring the pool lock.
+// Called by ReconcilePool (which holds the lock) and AllocateName (which also holds it).
+func (m *Manager) reconcilePoolInternal() {
 	// Get polecats with existing directories
 	polecats, err := m.List()
 	if err != nil {

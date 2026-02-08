@@ -9,9 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
+
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/util"
 )
 
 // Common errors
@@ -37,6 +40,18 @@ func NewManager(townRoot string, rigsConfig *config.RigsConfig) *Manager {
 		kennelPath: filepath.Join(townRoot, "deacon", "dogs"),
 		rigsConfig: rigsConfig,
 	}
+}
+
+// lockDog acquires an exclusive file lock for a specific dog's state operations.
+// This prevents concurrent load-modify-save races on .dog.json.
+// Caller must defer fl.Unlock().
+func (m *Manager) lockDog(name string) (*flock.Flock, error) {
+	lockPath := filepath.Join(m.dogDir(name), ".dog.lock")
+	fl := flock.New(lockPath)
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("acquiring dog lock for %s: %w", name, err)
+	}
+	return fl, nil
 }
 
 // validateDogName checks that a dog name is safe for use as a directory name.
@@ -301,6 +316,13 @@ func (m *Manager) SetState(name string, state State) error {
 		return ErrDogNotFound
 	}
 
+	// Acquire per-dog lock to prevent concurrent load-modify-save races
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
+
 	dogState, err := m.loadState(name)
 	if err != nil {
 		return fmt.Errorf("loading state: %w", err)
@@ -321,6 +343,13 @@ func (m *Manager) AssignWork(name, work string) error {
 	if !m.exists(name) {
 		return ErrDogNotFound
 	}
+
+	// Acquire per-dog lock to prevent concurrent load-modify-save races
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
 
 	state, err := m.loadState(name)
 	if err != nil {
@@ -343,6 +372,13 @@ func (m *Manager) ClearWork(name string) error {
 	if !m.exists(name) {
 		return ErrDogNotFound
 	}
+
+	// Acquire per-dog lock to prevent concurrent load-modify-save races
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
 
 	state, err := m.loadState(name)
 	if err != nil {
@@ -368,6 +404,13 @@ func (m *Manager) Refresh(name string) error {
 	if !m.exists(name) {
 		return ErrDogNotFound
 	}
+
+	// Acquire per-dog lock to prevent concurrent load-modify-save races
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
 
 	state, err := m.loadState(name)
 	if err != nil {
@@ -442,6 +485,13 @@ func (m *Manager) RefreshRig(name, rigName string) error {
 	if _, ok := m.rigsConfig.Rigs[rigName]; !ok {
 		return fmt.Errorf("rig %s not found in config", rigName)
 	}
+
+	// Acquire per-dog lock to prevent concurrent load-modify-save races
+	fl, err := m.lockDog(name)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = fl.Unlock() }()
 
 	state, err := m.loadState(name)
 	if err != nil {
@@ -578,14 +628,10 @@ func (m *Manager) loadState(name string) (*DogState, error) {
 	return &state, nil
 }
 
-// saveState saves a dog's state to .dog.json.
+// saveState saves a dog's state to .dog.json using atomic write (write-to-temp + rename).
+// This prevents concurrent loadState from seeing a truncated/empty file.
 func (m *Manager) saveState(name string, state *DogState) error {
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(m.stateFilePath(name), data, 0644) //nolint:gosec // G306: dog state is non-sensitive operational data
+	return util.AtomicWriteJSON(m.stateFilePath(name), state)
 }
 
 // GetIdleDog returns an idle dog suitable for work assignment.
