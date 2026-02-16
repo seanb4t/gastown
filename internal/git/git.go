@@ -189,7 +189,11 @@ func (g *Git) Clone(url, dest string) error {
 	}
 
 	// Configure hooks path for Gas Town clones
-	return configureHooksPath(dest)
+	if err := configureHooksPath(dest); err != nil {
+		return err
+	}
+	// Initialize submodules if present
+	return InitSubmodules(dest)
 }
 
 // CloneWithReference clones a repository using a local repo as an object reference.
@@ -229,7 +233,11 @@ func (g *Git) CloneWithReference(url, dest, reference string) error {
 	}
 
 	// Configure hooks path for Gas Town clones
-	return configureHooksPath(dest)
+	if err := configureHooksPath(dest); err != nil {
+		return err
+	}
+	// Initialize submodules if present
+	return InitSubmodules(dest)
 }
 
 // CloneBare clones a repository as a bare repo (no working directory).
@@ -848,34 +856,44 @@ func (g *Git) IsAncestor(ancestor, descendant string) (bool, error) {
 // WorktreeAdd creates a new worktree at the given path with a new branch.
 // The new branch is created from the current HEAD.
 func (g *Git) WorktreeAdd(path, branch string) error {
-	_, err := g.run("worktree", "add", "-b", branch, path)
-	return err
+	if _, err := g.run("worktree", "add", "-b", branch, path); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddFromRef creates a new worktree at the given path with a new branch
 // starting from the specified ref (e.g., "origin/main").
 func (g *Git) WorktreeAddFromRef(path, branch, startPoint string) error {
-	_, err := g.run("worktree", "add", "-b", branch, path, startPoint)
-	return err
+	if _, err := g.run("worktree", "add", "-b", branch, path, startPoint); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddDetached creates a new worktree at the given path with a detached HEAD.
 func (g *Git) WorktreeAddDetached(path, ref string) error {
-	_, err := g.run("worktree", "add", "--detach", path, ref)
-	return err
+	if _, err := g.run("worktree", "add", "--detach", path, ref); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddExisting creates a new worktree at the given path for an existing branch.
 func (g *Git) WorktreeAddExisting(path, branch string) error {
-	_, err := g.run("worktree", "add", path, branch)
-	return err
+	if _, err := g.run("worktree", "add", path, branch); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // WorktreeAddExistingForce creates a new worktree even if the branch is already checked out elsewhere.
 // This is useful for cross-rig worktrees where multiple clones need to be on main.
 func (g *Git) WorktreeAddExistingForce(path, branch string) error {
-	_, err := g.run("worktree", "add", "--force", path, branch)
-	return err
+	if _, err := g.run("worktree", "add", "--force", path, branch); err != nil {
+		return err
+	}
+	return InitSubmodules(path)
 }
 
 // IsSparseCheckoutConfigured checks if sparse checkout is enabled for a given repo/worktree.
@@ -1338,4 +1356,202 @@ func (g *Git) PruneStaleBranches(pattern string, dryRun bool) ([]PrunedBranch, e
 	}
 
 	return pruned, nil
+}
+
+// SubmoduleChange represents a changed submodule pointer between two refs.
+type SubmoduleChange struct {
+	Path   string // Submodule path relative to repo root
+	OldSHA string // Previous commit SHA (or empty for new submodule)
+	NewSHA string // New commit SHA (or empty for removed submodule)
+	URL    string // Submodule remote URL from .gitmodules
+}
+
+// InitSubmodules initializes and updates submodules if .gitmodules exists.
+// This is a no-op for repos without submodules.
+func InitSubmodules(repoPath string) error {
+	gitmodules := filepath.Join(repoPath, ".gitmodules")
+	if _, err := os.Stat(gitmodules); os.IsNotExist(err) {
+		return nil
+	}
+	cmd := exec.Command("git", "-C", repoPath, "submodule", "update", "--init", "--recursive")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("initializing submodules: %s", strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// SubmoduleChanges detects submodule pointer changes between two refs.
+// Returns nil if no submodules changed or if the repo has no submodules.
+func (g *Git) SubmoduleChanges(base, head string) ([]SubmoduleChange, error) {
+	// git diff --raw shows mode 160000 for gitlink (submodule) entries
+	out, err := g.run("diff", "--raw", base, head)
+	if err != nil {
+		return nil, fmt.Errorf("diffing for submodule changes: %w", err)
+	}
+	if out == "" {
+		return nil, nil
+	}
+
+	var changes []SubmoduleChange
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: :oldmode newmode oldsha newsha status\tpath
+		// Submodule entries have mode 160000
+		if !strings.Contains(line, "160000") {
+			continue
+		}
+		// Parse the raw diff line
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		path := strings.TrimSpace(parts[1])
+		fields := strings.Fields(parts[0])
+		if len(fields) < 5 {
+			continue
+		}
+		oldSHA := fields[2]
+		newSHA := fields[3]
+		// Null SHAs (all zeros) indicate added/removed submodules
+		if strings.Repeat("0", len(oldSHA)) == oldSHA {
+			oldSHA = ""
+		}
+		if strings.Repeat("0", len(newSHA)) == newSHA {
+			newSHA = ""
+		}
+
+		change := SubmoduleChange{
+			Path:   path,
+			OldSHA: oldSHA,
+			NewSHA: newSHA,
+		}
+
+		// Try to get the submodule URL from .gitmodules on the head ref
+		url, urlErr := g.submoduleURL(head, path)
+		if urlErr == nil {
+			change.URL = url
+		}
+
+		changes = append(changes, change)
+	}
+	return changes, nil
+}
+
+// submoduleURL reads the URL for a submodule from .gitmodules at a given ref.
+// Uses git config -f to parse the file correctly regardless of field ordering.
+func (g *Git) submoduleURL(ref, submodulePath string) (string, error) {
+	// Write .gitmodules from the ref to a temp file so we can use git config -f
+	content, err := g.run("show", ref+":.gitmodules")
+	if err != nil {
+		return "", err
+	}
+	tmpFile, err := os.CreateTemp("", "gitmodules-*")
+	if err != nil {
+		return "", fmt.Errorf("creating temp file for .gitmodules: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		return "", fmt.Errorf("writing temp .gitmodules: %w", err)
+	}
+	tmpFile.Close()
+
+	// List all submodule.<name>.path entries to find the section matching our path
+	cmd := exec.Command("git", "config", "-f", tmpFile.Name(), "--get-regexp", `^submodule\..*\.path$`)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("reading submodule paths from .gitmodules: %w", err)
+	}
+
+	var sectionName string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: submodule.<name>.path <value>
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) == 2 && strings.TrimSpace(parts[1]) == submodulePath {
+			key := parts[0]
+			key = strings.TrimPrefix(key, "submodule.")
+			key = strings.TrimSuffix(key, ".path")
+			sectionName = key
+			break
+		}
+	}
+	if sectionName == "" {
+		return "", fmt.Errorf("submodule URL not found for path %s", submodulePath)
+	}
+
+	// Get the URL for this section
+	urlCmd := exec.Command("git", "config", "-f", tmpFile.Name(), "--get", "submodule."+sectionName+".url")
+	var urlOut bytes.Buffer
+	urlCmd.Stdout = &urlOut
+	if err := urlCmd.Run(); err != nil {
+		return "", fmt.Errorf("reading URL for submodule %s: %w", sectionName, err)
+	}
+	url := strings.TrimSpace(urlOut.String())
+	if url == "" {
+		return "", fmt.Errorf("submodule URL not found for path %s", submodulePath)
+	}
+	return url, nil
+}
+
+// PushSubmoduleCommit pushes a specific commit SHA from a submodule to its remote.
+// The submodulePath is relative to the repo working directory.
+// The commit must exist in the submodule's object store (shared via .repo.git/modules/).
+func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
+	absPath := filepath.Join(g.workDir, submodulePath)
+	// Detect the remote's default branch (don't assume main)
+	defaultBranch, err := submoduleDefaultBranch(absPath, remote)
+	if err != nil {
+		return fmt.Errorf("detecting default branch for submodule %s: %w", submodulePath, err)
+	}
+	cmd := exec.Command("git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("pushing submodule %s commit %s: %s", submodulePath, sha[:8], strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+// submoduleDefaultBranch detects the default branch of a submodule's remote.
+// Tries local refs first to avoid network round-trips, falling back to remote queries.
+func submoduleDefaultBranch(submodulePath, remote string) (string, error) {
+	// Try local symbolic-ref first (no network, fastest)
+	symCmd := exec.Command("git", "-C", submodulePath, "symbolic-ref", "refs/remotes/"+remote+"/HEAD")
+	if symOut, err := symCmd.Output(); err == nil {
+		ref := strings.TrimSpace(string(symOut))
+		// refs/remotes/origin/HEAD -> refs/remotes/origin/main -> main
+		if parts := strings.Split(ref, "/"); len(parts) > 0 {
+			branch := parts[len(parts)-1]
+			if branch != "" {
+				return branch, nil
+			}
+		}
+	}
+
+	// Try local tracking refs (no network)
+	for _, candidate := range []string{"main", "master"} {
+		check := exec.Command("git", "-C", submodulePath, "rev-parse", "--verify", "--quiet", "refs/remotes/"+remote+"/"+candidate)
+		if check.Run() == nil {
+			return candidate, nil
+		}
+	}
+
+	// Fallback: network query via ls-remote
+	for _, candidate := range []string{"main", "master"} {
+		check := exec.Command("git", "-C", submodulePath, "ls-remote", "--exit-code", remote, "refs/heads/"+candidate)
+		if check.Run() == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("could not determine default branch for remote %s", remote)
 }
