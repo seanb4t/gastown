@@ -309,14 +309,17 @@ func TestHandoffPolecatEnvCheck(t *testing.T) {
 			origMessage := handoffMessage
 			origStdin := handoffStdin
 			origAuto := handoffAuto
+			origAgent := handoffAgent
 			defer func() {
 				handoffMessage = origMessage
 				handoffStdin = origStdin
 				handoffAuto = origAuto
+				handoffAgent = origAgent
 			}()
 			handoffMessage = ""
 			handoffStdin = false
 			handoffAuto = false
+			handoffAgent = ""
 
 			// The polecat path tries to exec "gt done" which will fail in tests.
 			// We capture stdout to detect the "Polecat detected" message, which
@@ -439,6 +442,140 @@ func TestWarnHandoffGitStatus(t *testing.T) {
 		})
 		if output != "" {
 			t.Errorf("expected no output with --no-git-check, got: %q", output)
+		}
+	})
+}
+
+func TestHandoffAgentFlag(t *testing.T) {
+	t.Run("--agent flag registered on command", func(t *testing.T) {
+		flag := handoffCmd.Flags().Lookup("agent")
+		if flag == nil {
+			t.Fatal("--agent flag not registered on handoff command")
+		}
+		if flag.Usage == "" {
+			t.Error("--agent flag has empty usage")
+		}
+	})
+
+	t.Run("buildRestartCommandWithAgent rejects unknown agent", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		// Create a minimal town root so detectTownRootFromCwd() can find it.
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		if err := os.MkdirAll(mayorDir, 0755); err != nil {
+			t.Fatalf("creating mayor dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+			t.Fatalf("creating town.json: %v", err)
+		}
+
+		// Point GT_ROOT at our temp town and chdir outside any real town so
+		// cwd-based detection falls back to the env var.
+		t.Setenv("GT_ROOT", tmpTown)
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		_, err := buildRestartCommandWithAgent("gt-crew-propane", "nonexistent-agent-xyz")
+		if err == nil {
+			t.Fatal("expected error for unknown agent, got nil")
+		}
+		if !strings.Contains(err.Error(), "nonexistent-agent-xyz") {
+			t.Errorf("expected agent name in error message, got: %v", err)
+		}
+	})
+
+	t.Run("buildRestartCommandWithAgent accepts known agent", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		// Same minimal town root setup.
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		os.MkdirAll(mayorDir, 0755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+
+		t.Setenv("GT_ROOT", tmpTown)
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		// "claude" is a built-in preset and must always be accepted.
+		cmd, err := buildRestartCommandWithAgent("gt-crew-propane", "claude")
+		if err != nil {
+			t.Fatalf("unexpected error for known agent 'claude': %v", err)
+		}
+		if !strings.Contains(cmd, "claude") {
+			t.Errorf("expected 'claude' in restart command, got: %q", cmd)
+		}
+	})
+
+	t.Run("agent override beats GT_AGENT env", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		os.MkdirAll(mayorDir, 0755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+
+		t.Setenv("GT_ROOT", tmpTown)
+		t.Setenv("GT_AGENT", "codex")
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		cmd, err := buildRestartCommandWithAgent("gt-crew-propane", "claude")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(cmd, "GT_AGENT=claude") {
+			t.Errorf("expected GT_AGENT=claude (override should beat env), got: %q", cmd)
+		}
+	})
+
+	t.Run("GT_AGENT env used when no override", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		os.MkdirAll(mayorDir, 0755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+
+		t.Setenv("GT_ROOT", tmpTown)
+		t.Setenv("GT_AGENT", "claude")
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		cmd, err := buildRestartCommandWithAgent("gt-crew-propane", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !strings.Contains(cmd, "GT_AGENT=claude") {
+			t.Errorf("expected GT_AGENT=claude from env, got: %q", cmd)
+		}
+	})
+
+	t.Run("default when neither override nor GT_AGENT set", func(t *testing.T) {
+		setupHandoffTestRegistry(t)
+
+		tmpTown := t.TempDir()
+		mayorDir := filepath.Join(tmpTown, "mayor")
+		os.MkdirAll(mayorDir, 0755)
+		os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644)
+
+		t.Setenv("GT_ROOT", tmpTown)
+		t.Setenv("GT_AGENT", "")
+		origCwd, _ := os.Getwd()
+		os.Chdir(os.TempDir())
+		t.Cleanup(func() { os.Chdir(origCwd) })
+
+		cmd, err := buildRestartCommandWithAgent("gt-crew-propane", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(cmd, "GT_AGENT=") {
+			t.Errorf("expected no GT_AGENT export when using defaults, got: %q", cmd)
 		}
 	})
 }
